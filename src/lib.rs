@@ -10,7 +10,7 @@
 //! - **Crash Recovery**: Messages survive application restarts and system crashes
 //! - **MPSC-like API**: Familiar channel-based interface compatible with async Rust
 //! - **Dead Letter Queue**: Corrupted messages automatically moved to separate database
-//! - **Batch Operations**: High-performance bulk send/receive (460x faster than single operations)
+//! - **Batch Operations**: High-performance bulk send/receive (~50x faster than single operations)
 //! - **Backpressure Support**: Optional queue size limits prevent unbounded growth
 //!
 //! ## Quick Start
@@ -87,6 +87,13 @@ pub enum DiskQueueError {
     InvalidTableName(String),
     #[error("Internal task error: {0}")]
     TaskJoin(String),
+    /// A worker thread panicked and poisoned an internal lock. This always indicates a bug.
+    #[error("Internal lock poisoned: {0}")]
+    LockPoisoned(String),
+    /// A corrupt item could not be moved to the dead letter queue. The original item is left
+    /// in the main queue (so it can be retried) and the underlying error is reported here.
+    #[error("Failed to write to dead letter queue: {0}")]
+    DlqWriteFailed(String),
     #[error("Queue is closed")]
     QueueClosed,
     #[error("Unexpected row count: {0}")]
@@ -96,6 +103,19 @@ pub enum DiskQueueError {
 }
 
 pub type Result<T> = std::result::Result<T, DiskQueueError>;
+
+/// Lock the SQLite mutex, mapping a poisoned lock to [`DiskQueueError::LockPoisoned`].
+///
+/// Mutex poisoning means a previous holder panicked while holding the lock; the database
+/// state is intact (SQLite is transactional) but the panic itself is a bug worth surfacing.
+fn lock_conn(
+    db: &Mutex<rusqlite::Connection>,
+) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+    db.lock().map_err(|e| {
+        error!("Internal lock poisoned: {}", e);
+        DiskQueueError::LockPoisoned(e.to_string())
+    })
+}
 
 /// Durability configuration for SQLite synchronous mode
 ///
@@ -437,7 +457,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// queue.send(Message { data: "hello".to_string() }).await?;
     /// # Ok(())
     /// # }
@@ -457,56 +477,68 @@ where
         let table_name = self.table_name.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Implement backpressure if max_size is configured
-            if let Some(max) = max_size {
-                let mut backoff = Duration::from_millis(10);
-                loop {
-                    let conn = db.lock().map_err(|e| {
-                        error!("Failed to acquire database lock: {}", e);
-                        DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
+            // The capacity check and insert run in a single BEGIN IMMEDIATE transaction so
+            // concurrent senders cannot both observe `count == max-1` and both insert.
+            let mut backoff = Duration::from_millis(10);
+            loop {
+                let mut conn = lock_conn(&db)?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| {
+                        error!(
+                            "Failed to start transaction for table {}: {}",
+                            table_name, e
+                        );
+                        DiskQueueError::Database(e)
                     })?;
-                    let count: i64 = conn
+
+                if let Some(max) = max_size {
+                    let count: i64 = tx
                         .query_row(&count_sql, [], |row| row.get(0))
                         .map_err(DiskQueueError::Database)?;
 
-                    if (count as usize) < max {
-                        break;
+                    if usize::try_from(count).unwrap_or(usize::MAX) >= max {
+                        // Queue is full: roll back the transaction, release the lock, and wait.
+                        drop(tx);
+                        drop(conn);
+                        warn!(
+                            table_name = %table_name,
+                            current_size = count,
+                            max_size = max,
+                            "Queue is full, waiting for space..."
+                        );
+                        std::thread::sleep(backoff);
+                        backoff = std::cmp::min(backoff * 2, Duration::from_secs(1));
+                        continue;
                     }
-
-                    // Queue is full, release lock and wait
-                    drop(conn);
-                    warn!(
-                        table_name = %table_name,
-                        current_size = count,
-                        max_size = max,
-                        "Queue is full, waiting for space..."
-                    );
-                    std::thread::sleep(backoff);
-                    backoff = std::cmp::min(backoff * 2, Duration::from_secs(1));
                 }
+
+                let rows_affected = tx.execute(&insert_sql, [&serialized]).map_err(|e| {
+                    error!(
+                        "Failed to insert item into queue table {}: {}",
+                        table_name, e
+                    );
+                    DiskQueueError::Database(e)
+                })?;
+
+                if rows_affected != 1 {
+                    error!("Expected to insert 1 row, but inserted {}", rows_affected);
+                    return Err(DiskQueueError::UnexpectedRowCount(format!(
+                        "Insert affected {rows_affected} rows instead of 1"
+                    )));
+                }
+
+                tx.commit().map_err(|e| {
+                    error!(
+                        "Failed to commit insert for table {}: {}",
+                        table_name, e
+                    );
+                    DiskQueueError::Database(e)
+                })?;
+
+                debug!("Successfully enqueued item to disk queue");
+                return Ok(());
             }
-
-            let conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
-            let rows_affected = conn.execute(&insert_sql, [&serialized]).map_err(|e| {
-                error!(
-                    "Failed to insert item into queue table {}: {}",
-                    table_name, e
-                );
-                DiskQueueError::Database(e)
-            })?;
-
-            if rows_affected != 1 {
-                error!("Expected to insert 1 row, but inserted {}", rows_affected);
-                return Err(DiskQueueError::UnexpectedRowCount(format!(
-                    "Insert affected {rows_affected} rows instead of 1"
-                )));
-            }
-
-            debug!("Successfully enqueued item to disk queue");
-            Ok(())
         })
         .await
         .map_err(|e| DiskQueueError::TaskJoin(e.to_string()))?
@@ -531,7 +563,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// let messages: Vec<Message> = (0..100)
     ///     .map(|i| Message { data: format!("msg_{}", i) })
     ///     .collect();
@@ -544,6 +576,14 @@ where
     pub async fn send_batch(&self, items: Vec<T>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
+        }
+
+        // Reject batches larger than max_size up front so we don't spin forever waiting
+        // for space that can never exist.
+        if let Some(max) = self.max_size
+            && items.len() > max
+        {
+            return Err(DiskQueueError::QueueFull(max));
         }
 
         let config = bincode::config::standard();
@@ -566,73 +606,75 @@ where
         let batch_size = serialized_items.len();
 
         tokio::task::spawn_blocking(move || {
-            // Implement backpressure if max_size is configured
-            if let Some(max) = max_size {
-                let mut backoff = Duration::from_millis(10);
-                loop {
-                    let conn = db.lock().map_err(|e| {
-                        error!("Failed to acquire database lock: {}", e);
-                        DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
+            // Capacity check and inserts run in the same BEGIN IMMEDIATE transaction so the
+            // queue cannot exceed `max_size` even with concurrent senders.
+            let mut backoff = Duration::from_millis(10);
+            loop {
+                let mut conn = lock_conn(&db)?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| {
+                        error!(
+                            "Failed to start transaction for batch insert on table {}: {}",
+                            table_name, e
+                        );
+                        DiskQueueError::Database(e)
                     })?;
-                    let count: i64 = conn
+
+                if let Some(max) = max_size {
+                    let count: i64 = tx
                         .query_row(&count_sql, [], |row| row.get(0))
                         .map_err(DiskQueueError::Database)?;
 
-                    // Check if we have space for the entire batch
-                    if (count as usize) + batch_size <= max {
-                        break;
+                    if usize::try_from(count).unwrap_or(usize::MAX) + batch_size > max {
+                        drop(tx);
+                        drop(conn);
+                        warn!(
+                            table_name = %table_name,
+                            current_size = count,
+                            max_size = max,
+                            batch_size = batch_size,
+                            "Queue is full, waiting for space for batch..."
+                        );
+                        std::thread::sleep(backoff);
+                        backoff = std::cmp::min(backoff * 2, Duration::from_secs(1));
+                        continue;
                     }
-
-                    // Queue is full, release lock and wait
-                    drop(conn);
-                    warn!(
-                        table_name = %table_name,
-                        current_size = count,
-                        max_size = max,
-                        batch_size = batch_size,
-                        "Queue is full, waiting for space for batch..."
-                    );
-                    std::thread::sleep(backoff);
-                    backoff = std::cmp::min(backoff * 2, Duration::from_secs(1));
                 }
-            }
 
-            let mut conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
+                {
+                    let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| {
+                        error!(
+                            "Failed to prepare INSERT for table {}: {}",
+                            table_name, e
+                        );
+                        DiskQueueError::Database(e)
+                    })?;
+                    for serialized in &serialized_items {
+                        stmt.execute([serialized]).map_err(|e| {
+                            error!(
+                                "Failed to insert item into queue table {} during batch: {}",
+                                table_name, e
+                            );
+                            DiskQueueError::Database(e)
+                        })?;
+                    }
+                }
 
-            // Use a transaction for atomic batch insert
-            let tx = conn.transaction().map_err(|e| {
-                error!("Failed to start transaction for batch insert: {}", e);
-                DiskQueueError::Database(e)
-            })?;
-
-            // Insert all items in the transaction
-            for serialized in &serialized_items {
-                tx.execute(&insert_sql, [serialized]).map_err(|e| {
+                tx.commit().map_err(|e| {
                     error!(
-                        "Failed to insert item into queue table {} during batch: {}",
+                        "Failed to commit batch transaction for table {}: {}",
                         table_name, e
                     );
                     DiskQueueError::Database(e)
                 })?;
-            }
 
-            // Commit the transaction
-            tx.commit().map_err(|e| {
-                error!(
-                    "Failed to commit batch transaction for table {}: {}",
-                    table_name, e
+                debug!(
+                    "Successfully enqueued {} items to disk queue in batch",
+                    batch_size
                 );
-                DiskQueueError::Database(e)
-            })?;
-
-            debug!(
-                "Successfully enqueued {} items to disk queue in batch",
-                batch_size
-            );
-            Ok(())
+                return Ok(());
+            }
         })
         .await
         .map_err(|e| DiskQueueError::TaskJoin(e.to_string()))?
@@ -655,11 +697,11 @@ where
     /// ```no_run
     /// # use disk_backed_queue::DiskBackedQueue;
     /// # use serde::{Deserialize, Serialize};
-    /// # #[derive(Serialize, Deserialize)]
+    /// # #[derive(Serialize, Deserialize, Debug)]
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// match queue.recv().await? {
     ///     Some(msg) => println!("Received: {:?}", msg),
     ///     None => println!("Queue is empty"),
@@ -677,10 +719,7 @@ where
         let table_name = self.table_name.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
+            let mut conn = lock_conn(&db)?;
 
             // Start a transaction for atomic read-delete
             let tx = conn.transaction().map_err(|e| {
@@ -709,49 +748,49 @@ where
                 let item: T = match bincode::serde::decode_from_slice(&data, config) {
                     Ok((item, _len)) => item,
                     Err(e) => {
-                        // Deserialization failed - move to dead letter queue
+                        // Deserialization failed - move to dead letter queue.
+                        // We require the DLQ insert to succeed before deleting from the main
+                        // queue, otherwise a DLQ failure would silently drop the message.
                         error!(
                             "Failed to deserialize item from queue (id {}): {}. Moving to DLQ.",
                             id, e
                         );
 
-                        // Insert into DLQ
-                        match dlq_db.lock() {
-                            Ok(dlq_conn) => {
-                                if let Err(dlq_error) = dlq_conn.execute(
+                        let dlq_result = match dlq_db.lock() {
+                            Ok(dlq_conn) => dlq_conn
+                                .execute(
                                     &dlq_insert_sql,
                                     rusqlite::params![id, &data, e.to_string()],
-                                ) {
-                                    error!(
-                                        "CRITICAL: Failed to insert corrupt item {} into DLQ for table {}: {}. Item will be dropped.",
-                                        id, table_name, dlq_error
-                                    );
-                                }
-                            }
-                            Err(poison_err) => {
-                                error!(
-                                    "CRITICAL: DLQ mutex poisoned while handling corrupt item {}: {}. Item will be dropped.",
-                                    id, poison_err
-                                );
-                            }
+                                )
+                                .map_err(|dlq_err| dlq_err.to_string()),
+                            Err(poison_err) => Err(format!("DLQ mutex poisoned: {poison_err}")),
+                        };
+
+                        if let Err(dlq_msg) = dlq_result {
+                            // Leave the corrupt row in the main queue (transaction rolls back
+                            // on drop) so the operator can intervene without losing data.
+                            error!(
+                                "Failed to write corrupt item {} from table {} to DLQ: {}. Item left in main queue.",
+                                id, table_name, dlq_msg
+                            );
+                            return Err(DiskQueueError::DlqWriteFailed(dlq_msg));
                         }
 
-                        // Delete from main queue
-                        tx.execute(&delete_sql, [&id]).map_err(|e| {
+                        // DLQ insert succeeded; safe to delete the corrupt row from main.
+                        tx.execute(&delete_sql, [&id]).map_err(|err| {
                             error!(
                                 "Failed to delete item {} from table {}: {}",
-                                id, table_name, e
+                                id, table_name, err
                             );
-                            DiskQueueError::Database(e)
+                            DiskQueueError::Database(err)
                         })?;
 
-                        // Commit the transaction
-                        tx.commit().map_err(|e| {
+                        tx.commit().map_err(|err| {
                             error!(
                                 "Failed to commit transaction after DLQ move for table {}: {}",
-                                table_name, e
+                                table_name, err
                             );
-                            DiskQueueError::Database(e)
+                            DiskQueueError::Database(err)
                         })?;
 
                         // Return deserialization error to signal corruption
@@ -825,7 +864,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// // Receive up to 100 messages at once
     /// let messages = queue.recv_batch(100).await?;
     /// println!("Received {} messages", messages.len());
@@ -844,10 +883,7 @@ where
         let dlq_insert_sql = self.dlq_insert_sql.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
+            let mut conn = lock_conn(&db)?;
 
             // Start a transaction for atomic batch read-delete
             let tx = conn.transaction().map_err(|e| {
@@ -855,22 +891,23 @@ where
                 DiskQueueError::Database(e)
             })?;
 
-            // Read up to `limit` oldest items
+            // Read up to `limit` oldest items.
             // Safety: `table_name` is validated at construction time to contain only
             // alphanumeric characters and underscores, preventing SQL injection.
-            // `limit` is a usize, so it can only contain numeric values.
             let select_batch_sql = format!(
-                "SELECT id, data FROM {} ORDER BY created_at ASC, id ASC LIMIT {}",
-                table_name, limit
+                "SELECT id, data FROM {table_name} ORDER BY created_at ASC, id ASC LIMIT ?"
             );
 
-            let mut stmt = tx.prepare(&select_batch_sql).map_err(|e| {
+            let mut stmt = tx.prepare_cached(&select_batch_sql).map_err(|e| {
                 error!("Failed to prepare SELECT statement for table {}: {}", table_name, e);
                 DiskQueueError::Database(e)
             })?;
 
+            let limit_param = i64::try_from(limit).unwrap_or(i64::MAX);
             let rows = stmt
-                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                .query_map([limit_param], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
                 .map_err(|e| {
                     error!("Failed to execute SELECT query on table {}: {}", table_name, e);
                     DiskQueueError::Database(e)
@@ -878,6 +915,7 @@ where
 
             let mut items = Vec::new();
             let mut ids_to_delete = Vec::new();
+            let mut dlq_failures: usize = 0;
             let config = bincode::config::standard();
 
             for row_result in rows {
@@ -893,35 +931,42 @@ where
                         ids_to_delete.push(id);
                     }
                     Err(e) => {
-                        // Deserialization failed - move to dead letter queue
+                        // Deserialization failed - move to dead letter queue.
+                        // Only mark for deletion if the DLQ insert succeeds, otherwise the
+                        // corrupt row stays in the main queue (no silent data loss).
                         error!(
                             "Failed to deserialize item from queue (id {}): {}. Moving to DLQ.",
                             id, e
                         );
 
-                        // Insert into DLQ (outside main transaction)
-                        match dlq_db.lock() {
-                            Ok(dlq_conn) => {
-                                if let Err(dlq_error) = dlq_conn.execute(
-                                    &dlq_insert_sql,
-                                    rusqlite::params![id, &data, e.to_string()],
-                                ) {
+                        let dlq_ok = match dlq_db.lock() {
+                            Ok(dlq_conn) => match dlq_conn.execute(
+                                &dlq_insert_sql,
+                                rusqlite::params![id, &data, e.to_string()],
+                            ) {
+                                Ok(_) => true,
+                                Err(dlq_err) => {
                                     error!(
-                                        "CRITICAL: Failed to insert corrupt item {} into DLQ for table {}: {}. Item will be dropped.",
-                                        id, table_name, dlq_error
+                                        "Failed to insert corrupt item {} into DLQ for table {}: {}. Leaving item in main queue.",
+                                        id, table_name, dlq_err
                                     );
+                                    false
                                 }
-                            }
+                            },
                             Err(poison_err) => {
                                 error!(
-                                    "CRITICAL: DLQ mutex poisoned while handling corrupt item {}: {}. Item will be dropped.",
+                                    "DLQ mutex poisoned while handling corrupt item {}: {}. Leaving item in main queue.",
                                     id, poison_err
                                 );
+                                false
                             }
-                        }
+                        };
 
-                        // Still need to delete from main queue to avoid poison pill loop
-                        ids_to_delete.push(id);
+                        if dlq_ok {
+                            ids_to_delete.push(id);
+                        } else {
+                            dlq_failures += 1;
+                        }
                     }
                 }
             }
@@ -979,6 +1024,24 @@ where
                 DiskQueueError::Database(e)
             })?;
 
+            // If every item we read failed to land in the DLQ and we have nothing valid to
+            // return, surface an error so the caller is not stuck silently spinning. If we
+            // recovered at least some items, return them and let the caller observe the DLQ
+            // failures via logs/metrics on the next call.
+            if dlq_failures > 0 && items.is_empty() {
+                return Err(DiskQueueError::DlqWriteFailed(format!(
+                    "{dlq_failures} corrupt item(s) could not be moved to DLQ"
+                )));
+            }
+
+            if dlq_failures > 0 {
+                warn!(
+                    table_name = %table_name,
+                    dlq_failures = dlq_failures,
+                    "Some corrupt items could not be moved to DLQ; they remain in the main queue"
+                );
+            }
+
             debug!("Successfully dequeued {} items from disk queue in batch", items.len());
             Ok(items)
         })
@@ -997,7 +1060,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// let count = queue.len().await?;
     /// println!("Queue has {} messages", count);
     /// # Ok(())
@@ -1009,14 +1072,11 @@ where
         let count_sql = self.queries.count_sql.clone();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
+            let conn = lock_conn(&db)?;
             let count: i64 = conn
                 .query_row(&count_sql, [], |row| row.get(0))
                 .map_err(DiskQueueError::Database)?;
-            Ok(count as usize)
+            Ok(usize::try_from(count).unwrap_or(usize::MAX))
         })
         .await
         .map_err(|e| DiskQueueError::TaskJoin(e.to_string()))?
@@ -1033,7 +1093,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// if queue.is_empty().await? {
     ///     println!("No messages to process");
     /// }
@@ -1042,7 +1102,23 @@ where
     /// ```
     #[instrument(skip_all, fields(table_name = %self.table_name))]
     pub async fn is_empty(&self) -> Result<bool> {
-        Ok(self.len().await? == 0)
+        let db = self.db.clone();
+        // Cheap O(1) check that stops at the first row instead of doing a full COUNT(*).
+        // Safety: `table_name` is validated at construction time.
+        let exists_sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)",
+            self.table_name
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let conn = lock_conn(&db)?;
+            let exists: i64 = conn
+                .query_row(&exists_sql, [], |row| row.get(0))
+                .map_err(DiskQueueError::Database)?;
+            Ok(exists == 0)
+        })
+        .await
+        .map_err(|e| DiskQueueError::TaskJoin(e.to_string()))?
     }
 
     /// Removes all messages from the queue.
@@ -1058,7 +1134,7 @@ where
     /// # struct Message { data: String }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let queue = DiskBackedQueue::new("queue.db", "messages".to_string(), None).await?;
+    /// # let queue = DiskBackedQueue::<Message>::new("queue.db", "messages".to_string(), None).await?;
     /// queue.clear().await?;
     /// assert!(queue.is_empty().await?);
     /// # Ok(())
@@ -1070,10 +1146,7 @@ where
         let clear_sql = self.queries.clear_sql.clone();
 
         tokio::task::spawn_blocking(move || {
-            let conn = db.lock().map_err(|e| {
-                error!("Failed to acquire database lock: {}", e);
-                DiskQueueError::TaskJoin(format!("Mutex poisoned: {}", e))
-            })?;
+            let conn = lock_conn(&db)?;
             conn.execute(&clear_sql, [])
                 .map_err(DiskQueueError::Database)?;
             debug!("Cleared disk queue");
@@ -1201,18 +1274,20 @@ where
     /// # }
     /// ```
     pub fn blocking_send(&self, item: T) -> Result<()> {
-        // Use block_in_place if we're in a runtime context, otherwise create a new runtime
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(self.send(item))
-            })
-        } else {
-            // Not in a runtime, create a new one
-            let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                error!("Failed to create Tokio runtime: {}", e);
-                DiskQueueError::TaskJoin(format!("Runtime creation failed: {}", e))
-            })?;
-            runtime.block_on(self.send(item))
+        // `tokio::task::block_in_place` only works on the multi-thread runtime; calling it
+        // from a current-thread runtime panics. We probe the runtime flavor and fall back
+        // to a temporary runtime when block_in_place is unavailable.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(self.send(item)))
+            }
+            _ => {
+                let runtime = tokio::runtime::Runtime::new().map_err(|e| {
+                    error!("Failed to create Tokio runtime: {}", e);
+                    DiskQueueError::TaskJoin(format!("Runtime creation failed: {e}"))
+                })?;
+                runtime.block_on(self.send(item))
+            }
         }
     }
 }
@@ -1989,9 +2064,9 @@ mod tests {
         assert_eq!(queue.len().await.unwrap(), 100);
 
         // Receive and verify all messages
-        for i in 0..100 {
+        for expected in &messages {
             let received = queue.recv().await.unwrap().unwrap();
-            assert_eq!(received, messages[i]);
+            assert_eq!(received, *expected);
         }
 
         assert!(queue.is_empty().await.unwrap());
@@ -2145,5 +2220,202 @@ mod tests {
             })
             .unwrap();
         assert_eq!(dlq_count, 1);
+    }
+
+    /// Concurrent senders racing into a bounded queue must never exceed `max_size`.
+    ///
+    /// Before the BEGIN IMMEDIATE fix, two senders that both observed `count == max-1`
+    /// could both insert and push the queue to `max+1`. With the atomic count+insert,
+    /// `len()` should never exceed `max` from any observation point.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_max_size_never_exceeded_under_contention() {
+        const MAX: usize = 10;
+        const SENDERS: usize = 50;
+        const PER_SENDER: usize = 5;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        // Use the queue directly so both producer and consumer can share it via Arc.
+        let queue = std::sync::Arc::new(
+            DiskBackedQueue::<TestMessage>::new(
+                temp_file.path(),
+                "race_test".to_string(),
+                Some(MAX),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Spawn a sampler that watches `len()` while senders contend. If the bound is
+        // ever violated, the assertion fires here.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let queue = queue.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let len = queue.len().await.unwrap();
+                    assert!(
+                        len <= MAX,
+                        "Queue length {len} exceeded max_size {MAX} — race fix regressed"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                }
+            })
+        };
+
+        // Spawn senders that race to fill the queue. Senders block when full and unblock
+        // as a separate consumer task drains items.
+        let mut send_handles = Vec::new();
+        for sender_id in 0..SENDERS {
+            let queue = queue.clone();
+            send_handles.push(tokio::spawn(async move {
+                for j in 0..PER_SENDER {
+                    queue
+                        .send(TestMessage {
+                            id: (sender_id * PER_SENDER + j) as u64,
+                            content: String::new(),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        // Drain in the background so senders eventually unblock.
+        let drainer = {
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                let total = SENDERS * PER_SENDER;
+                let mut received = 0;
+                while received < total {
+                    if queue.recv().await.unwrap().is_some() {
+                        received += 1;
+                    } else {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                }
+            })
+        };
+
+        for h in send_handles {
+            h.await.unwrap();
+        }
+        drainer.await.unwrap();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        assert!(queue.is_empty().await.unwrap());
+    }
+
+    /// `blocking_send` from a current-thread runtime must not panic.
+    ///
+    /// `tokio::task::block_in_place` panics on the current-thread runtime, so the
+    /// implementation falls back to a temporary runtime in that case.
+    #[tokio::test] // default flavor is current_thread
+    async fn test_blocking_send_on_current_thread_runtime() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let (tx, mut rx) = disk_backed_channel::<TestMessage, _>(
+            temp_file.path(),
+            "blocking_ct_test".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let msg = TestMessage {
+            id: 7,
+            content: "from current-thread".to_string(),
+        };
+
+        // Run blocking_send on a separate OS thread so we don't block the current-thread
+        // runtime that's hosting the test (which would deadlock the recv below).
+        let tx_clone = tx.clone();
+        let msg_clone = msg.clone();
+        let handle =
+            std::thread::spawn(move || tx_clone.blocking_send(msg_clone));
+        // Hand back to the runtime so the spawned thread can make progress on its own
+        // temporary runtime without contention with this current_thread executor.
+        tokio::task::yield_now().await;
+        handle.join().expect("thread panicked").unwrap();
+
+        let received = rx.recv().await.unwrap().unwrap();
+        assert_eq!(received, msg);
+    }
+
+    /// `send_batch` rejects batches larger than `max_size` immediately rather than
+    /// blocking forever waiting for space that can never exist.
+    #[tokio::test]
+    async fn test_send_batch_rejects_oversized_batch() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let queue =
+            DiskBackedQueue::new(temp_file.path(), "oversize_test".to_string(), Some(5))
+                .await
+                .unwrap();
+
+        let oversized: Vec<TestMessage> = (0..10)
+            .map(|i| TestMessage {
+                id: i,
+                content: String::new(),
+            })
+            .collect();
+
+        let result = queue.send_batch(oversized).await;
+        assert!(
+            matches!(result, Err(DiskQueueError::QueueFull(5))),
+            "Expected QueueFull(5), got: {result:?}"
+        );
+
+        // Queue should still be empty and usable.
+        assert!(queue.is_empty().await.unwrap());
+        let small_batch = vec![
+            TestMessage {
+                id: 0,
+                content: String::new(),
+            };
+            3
+        ];
+        queue.send_batch(small_batch).await.unwrap();
+        assert_eq!(queue.len().await.unwrap(), 3);
+    }
+
+    /// `clear()` removes all messages, leaves the queue functional for further sends/recvs,
+    /// and is a no-op when the queue is already empty.
+    #[tokio::test]
+    async fn test_clear_empties_queue_and_remains_usable() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let queue =
+            DiskBackedQueue::new(temp_file.path(), "clear_test".to_string(), None)
+                .await
+                .unwrap();
+
+        // Clear on an empty queue should be a no-op.
+        queue.clear().await.unwrap();
+        assert!(queue.is_empty().await.unwrap());
+
+        // Populate, clear, verify empty.
+        for i in 0..25 {
+            queue
+                .send(TestMessage {
+                    id: i,
+                    content: format!("msg {i}"),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(queue.len().await.unwrap(), 25);
+
+        queue.clear().await.unwrap();
+        assert!(queue.is_empty().await.unwrap());
+        assert_eq!(queue.len().await.unwrap(), 0);
+        assert!(queue.recv().await.unwrap().is_none());
+
+        // Queue must remain usable after clear.
+        let after = TestMessage {
+            id: 999,
+            content: "after-clear".to_string(),
+        };
+        queue.send(after.clone()).await.unwrap();
+        assert_eq!(queue.recv().await.unwrap().unwrap(), after);
     }
 }
