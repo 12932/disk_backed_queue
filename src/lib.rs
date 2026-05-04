@@ -72,34 +72,56 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use thiserror::Error;
 use tracing::{debug, error, instrument, warn};
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum DiskQueueError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::error::EncodeError),
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] bincode::error::DecodeError),
-    #[error("Invalid table name: {0}")]
+    Database(rusqlite::Error),
+    Serialization(postcard::Error),
+    Deserialization(postcard::Error),
     InvalidTableName(String),
-    #[error("Internal task error: {0}")]
     TaskJoin(String),
-    /// A worker thread panicked and poisoned an internal lock. This always indicates a bug.
-    #[error("Internal lock poisoned: {0}")]
+    /// A worker thread panicked and poisoned an internal lock. Always indicates a bug.
     LockPoisoned(String),
     /// A corrupt item could not be moved to the dead letter queue. The original item is left
     /// in the main queue (so it can be retried) and the underlying error is reported here.
-    #[error("Failed to write to dead letter queue: {0}")]
     DlqWriteFailed(String),
-    #[error("Queue is closed")]
     QueueClosed,
-    #[error("Unexpected row count: {0}")]
     UnexpectedRowCount(String),
-    #[error("Queue is full (max size: {0})")]
     QueueFull(usize),
+}
+
+impl std::fmt::Display for DiskQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(e) => write!(f, "Database error: {e}"),
+            Self::Serialization(e) => write!(f, "Serialization error: {e}"),
+            Self::Deserialization(e) => write!(f, "Deserialization error: {e}"),
+            Self::InvalidTableName(s) => write!(f, "Invalid table name: {s}"),
+            Self::TaskJoin(s) => write!(f, "Internal task error: {s}"),
+            Self::LockPoisoned(s) => write!(f, "Internal lock poisoned: {s}"),
+            Self::DlqWriteFailed(s) => write!(f, "Failed to write to dead letter queue: {s}"),
+            Self::QueueClosed => f.write_str("Queue is closed"),
+            Self::UnexpectedRowCount(s) => write!(f, "Unexpected row count: {s}"),
+            Self::QueueFull(n) => write!(f, "Queue is full (max size: {n})"),
+        }
+    }
+}
+
+impl std::error::Error for DiskQueueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(e) => Some(e),
+            Self::Serialization(e) | Self::Deserialization(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for DiskQueueError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, DiskQueueError>;
@@ -439,7 +461,7 @@ where
 
     /// Send a single message to the queue.
     ///
-    /// The message is serialized using bincode and persisted to SQLite before this
+    /// The message is serialized using postcard and persisted to SQLite before this
     /// method returns. If the queue has a `max_size` configured and the queue is full,
     /// this method will block with exponential backoff until space becomes available.
     ///
@@ -464,8 +486,7 @@ where
     /// ```
     #[instrument(skip_all, fields(table_name = %self.table_name))]
     pub async fn send(&self, item: T) -> Result<()> {
-        let config = bincode::config::standard();
-        let serialized = bincode::serde::encode_to_vec(&item, config).map_err(|e| {
+        let serialized = postcard::to_allocvec(&item).map_err(|e| {
             error!("Failed to serialize item for queue: {}", e);
             DiskQueueError::Serialization(e)
         })?;
@@ -586,12 +607,11 @@ where
             return Err(DiskQueueError::QueueFull(max));
         }
 
-        let config = bincode::config::standard();
         let mut serialized_items = Vec::with_capacity(items.len());
 
         // Serialize all items first (outside spawn_blocking for error handling)
         for item in items {
-            let serialized = bincode::serde::encode_to_vec(&item, config).map_err(|e| {
+            let serialized = postcard::to_allocvec(&item).map_err(|e| {
                 error!("Failed to serialize item for batch queue: {}", e);
                 DiskQueueError::Serialization(e)
             })?;
@@ -744,9 +764,8 @@ where
 
             if let Some((id, data)) = result {
                 // Try to deserialize BEFORE deleting
-                let config = bincode::config::standard();
-                let item: T = match bincode::serde::decode_from_slice(&data, config) {
-                    Ok((item, _len)) => item,
+                let item: T = match postcard::from_bytes::<T>(&data) {
+                    Ok(item) => item,
                     Err(e) => {
                         // Deserialization failed - move to dead letter queue.
                         // We require the DLQ insert to succeed before deleting from the main
@@ -916,7 +935,6 @@ where
             let mut items = Vec::new();
             let mut ids_to_delete = Vec::new();
             let mut dlq_failures: usize = 0;
-            let config = bincode::config::standard();
 
             for row_result in rows {
                 let (id, data) = row_result.map_err(|e| {
@@ -925,8 +943,8 @@ where
                 })?;
 
                 // Try to deserialize
-                match bincode::serde::decode_from_slice(&data, config) {
-                    Ok((item, _len)) => {
+                match postcard::from_bytes::<T>(&data) {
+                    Ok(item) => {
                         items.push(item);
                         ids_to_delete.push(id);
                     }
@@ -1573,7 +1591,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_derive::{Deserialize, Serialize};
+    use serde::{Deserialize, Serialize};
     use tempfile::NamedTempFile;
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -1693,7 +1711,7 @@ mod tests {
         // Manually corrupt the database by writing invalid binary data
         {
             let db = queue.db.lock().unwrap();
-            let garbage_data: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid bincode
+            let garbage_data: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid postcard
             db.execute(
                 "UPDATE test_queue SET data = ? WHERE id = 1",
                 [&garbage_data],
@@ -1968,7 +1986,7 @@ mod tests {
         // Manually corrupt the database by writing invalid binary data
         {
             let db = queue.db.lock().unwrap();
-            let garbage_data: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid bincode
+            let garbage_data: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0xFC]; // Invalid postcard
             db.execute(
                 "UPDATE test_queue SET data = ? WHERE id = 1",
                 [&garbage_data],

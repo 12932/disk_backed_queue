@@ -12,7 +12,7 @@ A robust, crash-resistant queue implementation for Rust that persists all data t
 - **Batch Operations**: Bulk send/receive amortize fsync cost (~50x throughput vs. single ops on typical SSDs)
 - **Backpressure**: Optional `max_size` blocks senders when full; `send_batch` rejects oversized batches up front
 - **Atomic Capacity Check**: Concurrent senders cannot exceed `max_size` (count + insert run in one `BEGIN IMMEDIATE` transaction)
-- **Binary Serialization**: Compact bincode encoding
+- **Binary Serialization**: Compact postcard (varint) encoding
 
 > **What it doesn't do:** there is no ack/visibility-timeout mechanism. Once `recv` returns a message, it has been deleted from the queue. If your consumer crashes *while processing* it, that message is gone. For end-to-end at-least-once, make your processing idempotent or layer an in-flight table on top.
 
@@ -106,7 +106,7 @@ println!("Received {} messages", received.len());
 my_queue.db               # Main queue database
 ├── messages table
 │   ├── id (PRIMARY KEY)
-│   ├── data (BLOB)       # Bincode-serialized message
+│   ├── data (BLOB)       # Postcard-serialized message
 │   └── created_at (INT)  # Unix timestamp
 
 my_queue.dlq.db           # Dead letter queue
@@ -310,8 +310,8 @@ match rx.recv().await {
 ### Error Types
 
 - `Database(rusqlite::Error)` — SQLite database errors
-- `Serialization(bincode::error::EncodeError)` — Failed to serialize an outgoing message
-- `Deserialization(bincode::error::DecodeError)` — Stored bytes did not decode; the row has been moved to the DLQ before this is returned
+- `Serialization(postcard::Error)` — Failed to serialize an outgoing message
+- `Deserialization(postcard::Error)` — Stored bytes did not decode; the row has been moved to the DLQ before this is returned
 - `DlqWriteFailed(String)` — A corrupt row was found but the DLQ write failed; the row is left in the main queue so it can be retried (no silent data loss)
 - `LockPoisoned(String)` — An internal mutex was poisoned by a panic in another worker. Always indicates a bug
 - `InvalidTableName(String)` — Table name was empty, longer than 128 chars, or contained non-`[A-Za-z0-9_]`

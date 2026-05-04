@@ -5,7 +5,7 @@
 // spot-checks, not comprehensive benchmarking.
 
 use disk_backed_queue::disk_backed_channel;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tempfile::NamedTempFile;
 
