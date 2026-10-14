@@ -8,15 +8,53 @@ This document records all problems identified during the project review and all 
 - **Reviewed commit:** `5cf4c59` (`v0.1.3`).
 - **Reviewed files:** `src/lib.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`, `benches/queue_benchmark.rs`, `examples/throughput_demo.rs`, and the existing unit tests.
 - **Test environment:** Windows, `rustc` 1.99.0, Cargo 1.99.0, and cargo-nextest 0.9.129.
-- **Implementation status:** all remediation work below remains open. This document does not change library behavior, the public API, or the database schema.
+- **Implementation status:** see [Implementation status](#implementation-status). The problem and solution sections below are the original review record.
 - **References:** file and line references refer to the reviewed commit and will move as fixes are implemented.
 
 The normal send/receive and persistence paths work. The highest-priority defects are message loss when receives are cancelled and loss of progress when full senders occupy Tokio's blocking workers. Other findings concern runtime usage, independent SQLite connections, ordering, identifier handling, dead-letter isolation, serialization, documentation, and test reliability.
 
 Some findings are reproducible implementation defects; others are robustness gaps, misleading documentation, or missing tests. In particular, duplicate dead letters, strict input consumption, and the meaning of an empty batch require explicit API contracts rather than assumptions.
 
+## Implementation status
+
+Implemented in the working tree after `9c17360`. Scope decision: fix the defects **without** changing the `recv() -> T` API (the S01 claim/ack redesign is deferred), and store dead letters in the main database (S08 preferred design). Verified on Linux with rustc 1.99.0 and 1.88.0.
+
+| ID | Status | What was done |
+| --- | --- | --- |
+| P01 | Fixed without S01 | A receive transaction deletes the rows but commits only after the receiving future has accepted them (`Handoff`). A dropped future, or one left unpolled for 1 s, rolls back; the future retries if polled again. Delivery to the caller is at-least-once. Claim/ack, leases and fencing are deferred. |
+| P02 | Fixed | Each insert attempt is one finite `BEGIN IMMEDIATE` job. Waiting for capacity is async: `Notify` is registered before the check. A helper thread, running only while senders wait, wakes them every 100 ms to notice space freed by other connections; Tokio's timer is not needed. |
+| P03 | Fixed | Dropping a waiting send stops further attempts and does not hold up shutdown. An insert already running may still commit (documented). Idempotency keys are deferred. |
+| P04 | Fixed | `Some(0)` is rejected with the new `InvalidConfiguration` error before any file is touched. |
+| P05 | Fixed | Outside a runtime: synchronous write on the calling thread (no temporary runtime). Multi-thread runtime: the same synchronous write inside `block_in_place`, which needs no thread from the blocking pool. Current-thread runtime: new `UnsupportedRuntime` error, including on `spawn_blocking` threads, because Tokio cannot tell them apart from the executor thread; `Handle::block_on(send(..))` is documented as the alternative. |
+| P06 | Fixed | Every read-then-modify transaction uses `BEGIN IMMEDIATE`. Receiving from an empty queue answers from a plain read without taking the write lock. A busy error (lock held past the 5 s busy timeout) is retried twice, each time as a new blocking job. |
+| P07 | Fixed | Initialization runs in `spawn_blocking`, and every step is idempotent. |
+| P08 | Fixed | Ordering uses `id`. The legacy `created_at` index is dropped on open. |
+| P09 | Fixed | All identifiers are quoted. The `sqlite_` and `__disk_queue` prefixes are reserved (case-insensitive). The limit is documented as 128 UTF-8 bytes, and Unicode letters and digits are still accepted. |
+| P10, P12 | Fixed | Dead letters live in `__disk_queue_dlq` (with `queue_name` and the original `created_at`) in the main database. They are moved in the same transaction that deletes the row, with row-count checks. Legacy `.dlq.db` files are neither read nor imported; they are left untouched and a warning is logged. |
+| P11 | Fixed | Benchmarks use `iter_custom` with untimed setup and teardown and a `TempDir`. Recv benchmarks were added. |
+| P13 | Fixed | `recv_batch` keyset-scans past dead-lettered rows, so an empty batch means no deliverable message remains. A DLQ write failure now fails the whole batch; previously the bad row was skipped. |
+| P14 | Partly fixed | Decoding must consume every byte; trailing or truncated payloads go to the DLQ. Message-format versioning is deferred. |
+| P15 | Fixed | `rust-version = "1.88"`. The library build and tests were verified with rustc 1.88.0, and 1.87 is rejected by Cargo. No CI exists in the repo, so no MSRV job was added. |
+| P16, P17 | Fixed | Rustdoc and README rewritten: WAL durability levels, at-least-once receive, cancellation, and producer-outcome gaps. |
+| P18 | Fixed | The 5× speedup test was removed. |
+| P19 | Fixed | `cargo fmt --all` applied. |
+| P20 | Fixed | Regression tests were added for every reproduced defect and positive invariant: 50 library tests, up from 23. |
+
+Behavior changes for users, which warrant a 0.2.0 release: `DiskQueueError` gains two variants and becomes `#[non_exhaustive]`; dead letters move into the main database; `Some(0)` and reserved table names are rejected; `blocking_send` returns an error on a current-thread runtime instead of panicking; payloads with trailing bytes are dead-lettered; `recv_batch` fails on a DLQ write failure. In addition, a read-only query on *another* connection can see a received message for about one fsync after `recv` returns, until the deletion commits.
+
+Follow-up beyond the review, same working tree:
+- **Bounded-queue capacity check.** It now uses the id span (`MAX(id) - MIN(id) + 1`, O(log n)) instead of `COUNT(*)`, which reads every row. Bounded single sends at 100,000 queued messages went from 14 to ~760 msg/s on NVMe; they were 118 msg/s at 10,000 queued. The span is an upper bound on the count, so `max_size` still holds; gaps from rows deleted out of order outside the library cause early backpressure.
+- **Dependencies.** Updated to the latest releases: tokio 1.53.3, serde 1.0.229, and rusqlite 0.40.2, which bundles SQLite 3.53.2. All other direct dependencies were already current, and every resolved version supports Rust 1.88.
+
+- **Second, adversarial review of this implementation.** Fixed: busy errors with several connections under load (see P06); a panic on full bounded queues when the runtime has no timer; a `blocking_send` hang inside `spawn_blocking` with one blocking thread; a panicking `Deserialize` impl poisoning the queue permanently (such messages are now dead-lettered); a flaky fixed sleep in `test_max_size_blocks`. Documented rather than changed: `recv` returning before its deletion commits, which is the at-least-once design (`std::process::exit` right after `recv` can cause redelivery), and `blocking_send` refusing current-thread runtimes even on blocking threads.
+
+Still open: S01 claim/ack, S02 producer idempotency keys, S11 message-format versioning, importing legacy DLQ files, CI (Windows/Linux, MSRV job), `cargo audit` and nextest (neither installed here; `cargo test` was used).
+
+Performance on Linux NVMe, `DurabilityLevel::Full`, 1 KiB messages, steady state: single send ~806 → ~850 msg/s, single recv ~811 → ~852 msg/s, batch send (100) ~23.3k → ~26.3k msg/s, batch recv (100) ~32.1k → ~37.4k msg/s. The gains come from dropping the `created_at` index and from overlapping the receive commit with the caller. On a brand-new database, single sends are about 7% slower for the first ~500 commits, because the WAL takes longer to reach its first checkpoint now that each commit writes fewer pages.
+
 ## Contents
 
+0. [Implementation status](#implementation-status)
 1. [All identified problems](#all-identified-problems)
 2. [All proposed solutions](#all-proposed-solutions)
 3. [Validation performed](#validation-performed)
@@ -779,49 +817,49 @@ Permanent versions belong in the project's normal regression test suite, not und
 
 ## Regression and acceptance checklist
 
-All items are open until the corresponding implementation and verification are completed.
+Checked items were implemented and verified locally (see [Implementation status](#implementation-status)); unchecked items remain open.
 
 ### Delivery, capacity, and shutdown
 
-- [ ] Cancelling single/batch claims cannot delete an unacknowledged payload.
+- [x] Cancelling single/batch claims cannot delete an unacknowledged payload. *(Implemented for `recv`/`recv_batch` without a claim API: a cancelled receive cannot delete an undelivered payload.)*
 - [ ] Abandoned claims and process restarts permit redelivery after lease expiry.
 - [ ] A stale receipt cannot acknowledge/delete a newer claim.
 - [ ] Lease renewal, release, and acknowledgment retries have documented behavior.
 - [ ] Batch acknowledgment has tested atomicity and affected-row validation.
 - [ ] Capacity counts ready plus claimed/unacknowledged rows.
-- [ ] A full queue remains drainable with one blocking worker.
-- [ ] Cancelling a capacity waiter stops future attempts; no immortal worker remains.
-- [ ] Runtime shutdown is not held indefinitely by async capacity waiters.
-- [ ] Zero capacity and oversized batches produce deliberate errors.
+- [x] A full queue remains drainable with one blocking worker.
+- [x] Cancelling a capacity waiter stops future attempts; no immortal worker remains.
+- [x] Runtime shutdown is not held indefinitely by async capacity waiters.
+- [x] Zero capacity and oversized batches produce deliberate errors.
 - [ ] Producer retry keys reconcile committed-but-unobserved enqueues and reject conflicting payloads.
 
 ### SQLite, names, and message integrity
 
-- [ ] Independent receivers and producers do not encounter deferred snapshot-upgrade failures in the supported access pattern.
-- [ ] Remaining busy errors use finite attempts and bounded async retry policies.
-- [ ] Initialization does not block executor timers and is safe to retry after cancellation.
-- [ ] FIFO is based on insertion IDs, including backward/equal timestamps and reopen.
-- [ ] All generated SQL identifiers use one quoting policy.
-- [ ] Keyword, digit-leading, Unicode, invalid, and reserved names have tested behavior.
-- [ ] Logical queue identities and DLQ storage cannot collide across independent queues.
-- [ ] Quarantine insert/delete either commit together or preserve the original row.
-- [ ] Failed/retried transfers do not create new duplicate dead letters.
-- [ ] Legacy shared DLQs are not silently misattributed during migration.
-- [ ] An all-corrupt prefix does not hide valid batch messages behind an ambiguous empty result.
-- [ ] Trailing/truncated bytes and unsupported message versions preserve the original payload in a recoverable form.
-- [ ] Already-working batch rollback, large deletion chunks, and DLQ-failure preservation remain covered.
+- [x] Independent receivers and producers do not encounter deferred snapshot-upgrade failures in the supported access pattern.
+- [x] Remaining busy errors use finite attempts and bounded async retry policies. *(Busy errors are retried twice; each attempt is a new finite blocking job, bounded by the 5 s busy timeout.)*
+- [x] Initialization does not block executor timers and is safe to retry after cancellation.
+- [x] FIFO is based on insertion IDs, including backward/equal timestamps and reopen.
+- [x] All generated SQL identifiers use one quoting policy.
+- [x] Keyword, digit-leading, Unicode, invalid, and reserved names have tested behavior.
+- [x] Logical queue identities and DLQ storage cannot collide across independent queues.
+- [x] Quarantine insert/delete either commit together or preserve the original row.
+- [x] Failed/retried transfers do not create new duplicate dead letters.
+- [x] Legacy shared DLQs are not silently misattributed during migration. *(Legacy files are not imported at all.)*
+- [x] An all-corrupt prefix does not hide valid batch messages behind an ambiguous empty result.
+- [ ] Trailing/truncated bytes and unsupported message versions preserve the original payload in a recoverable form. *(Partly: trailing/truncated bytes are dead-lettered; format versions are not implemented.)*
+- [x] Already-working batch rollback, large deletion chunks, and DLQ-failure preservation remain covered.
 
 ### API, documentation, and tooling
 
-- [ ] `blocking_send` has tested outside-runtime, multi-thread, and current-thread behavior without a nested-runtime panic.
-- [ ] Receive API compatibility and the proposed breaking release/migration strategy are explicit.
-- [ ] The declared MSRV builds the supported project/dependency configuration.
-- [ ] Durability documentation correctly describes WAL `NORMAL`, `FULL`, and `EXTRA`.
-- [ ] Delivery documentation distinguishes persistence, claim recovery, acknowledgment, and duplicate processing.
-- [ ] Examples and DLQ recovery commands match the implemented schema and API.
-- [ ] Unit tests no longer require a fixed performance multiplier.
-- [ ] Benchmarks run without nested runtimes and label measurement boundaries correctly.
-- [ ] Formatting, Clippy, nextest, doctests, benchmark smoke tests, and dependency auditing pass in CI.
+- [x] `blocking_send` has tested outside-runtime, multi-thread, and current-thread behavior without a nested-runtime panic.
+- [x] Receive API compatibility and the proposed breaking release/migration strategy are explicit. *(The receive API is unchanged; other breaking changes are listed above.)*
+- [x] The declared MSRV builds the supported project/dependency configuration.
+- [x] Durability documentation correctly describes WAL `NORMAL`, `FULL`, and `EXTRA`.
+- [x] Delivery documentation distinguishes persistence, claim recovery, acknowledgment, and duplicate processing.
+- [x] Examples and DLQ recovery commands match the implemented schema and API.
+- [x] Unit tests no longer require a fixed performance multiplier.
+- [x] Benchmarks run without nested runtimes and label measurement boundaries correctly.
+- [ ] Formatting, Clippy, nextest, doctests, benchmark smoke tests, and dependency auditing pass in CI. *(Locally: fmt, clippy, `cargo test --all-targets`, doctests and the bench smoke test pass; no CI exists, and nextest and `cargo audit` were not available.)*
 - [ ] Windows/Linux and MSRV/stable coverage are established.
 
 ## Recommended implementation order
